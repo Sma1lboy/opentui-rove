@@ -2643,6 +2643,9 @@ pub const CliRenderer = struct {
 
             self.encode_work.rows_diffed += 1;
             var runLength: u32 = 0;
+            // Column the terminal cursor sits on after the last cell written in this row, when that is
+            // known for certain: a single-width cell. Unknown after a skipped cell or a grapheme.
+            var cursor_x: ?u32 = null;
             const cells_updated_before_row = cellsUpdated;
 
             for (0..self.width) |ux| {
@@ -2665,6 +2668,7 @@ pub const CliRenderer = struct {
                             writer.writeAll(ansi.ANSI.reset) catch {};
                             runLength = 0;
                         }
+                        cursor_x = null;
                         continue;
                     }
                 }
@@ -2684,6 +2688,7 @@ pub const CliRenderer = struct {
                             writer.writeAll(ansi.ANSI.reset) catch {};
                             runLength = 0;
                         }
+                        cursor_x = null;
                         if (currentCell.?.char != cell.char) self.currentRenderBuffer.syncCell(x, y, cell);
                         continue;
                     }
@@ -2702,6 +2707,7 @@ pub const CliRenderer = struct {
                     currentBg = null;
                     currentAttributes = null;
                     runLength = 0;
+                    cursor_x = null;
                     self.currentRenderBuffer.syncCell(x, y, cell);
                     cellsUpdated += 1;
                     imageCellsCleared += 1;
@@ -2713,6 +2719,7 @@ pub const CliRenderer = struct {
                     // position the next printable cell inside the wide grapheme.
                     self.currentRenderBuffer.syncCell(x, y, cell);
                     cellsUpdated += 1;
+                    cursor_x = null;
                     continue;
                 }
 
@@ -2744,25 +2751,38 @@ pub const CliRenderer = struct {
                 }
 
                 if (!sameAttributes or runLength == 0) {
-                    if (runLength > 0) {
-                        writer.writeAll(ansi.ANSI.reset) catch {};
-                    }
+                    const new_base = ansi.TextAttributes.getBaseAttributes(cell.attributes);
+                    const cur_base = if (currentAttributes) |a| ansi.TextAttributes.getBaseAttributes(a) else 0;
+                    const at_cursor = if (cursor_x) |cx| cx == x else false;
 
-                    runLength = 0;
+                    // Mid-run, with the terminal cursor already on this cell and no attribute to turn
+                    // off, a style change needs only what differs: no reset, no move, no repeated color.
+                    if (runLength > 0 and at_cursor and (cur_base & ~new_base) == 0) {
+                        if (!fgMatch) self.emitColor(writer, cell.fg, false);
+                        if (!bgMatch) self.emitColor(writer, cell.bg, true);
+                        if (new_base != cur_base) ansi.TextAttributes.applyAttributesOutputWriter(writer, new_base & ~cur_base) catch {};
+                    } else {
+                        if (runLength > 0) {
+                            writer.writeAll(ansi.ANSI.reset) catch {};
+                        }
+
+                        runLength = 0;
+
+                        if (!at_cursor) ansi.ANSI.moveToOutput(writer, x + 1, y + 1 + self.renderOffset) catch {};
+
+                        self.emitColor(writer, cell.fg, false);
+                        self.emitColor(writer, cell.bg, true);
+
+                        ansi.TextAttributes.applyAttributesOutputWriter(writer, cell.attributes) catch {};
+                    }
 
                     currentFg = cell.fg;
                     currentBg = cell.bg;
                     currentAttributes = cell.attributes;
-
-                    ansi.ANSI.moveToOutput(writer, x + 1, y + 1 + self.renderOffset) catch {};
-
-                    self.emitColor(writer, cell.fg, false);
-                    self.emitColor(writer, cell.bg, true);
-
-                    ansi.TextAttributes.applyAttributesOutputWriter(writer, cell.attributes) catch {};
                 }
 
                 // Handle grapheme characters
+                var ascii_cell = false;
                 switch (cell_type) {
                     gp.CHAR_FLAG_IMAGE => {
                         const fallback = buf.quadrantChars[gp.imageFallbackFromChar(cell.char)];
@@ -2794,12 +2814,15 @@ pub const CliRenderer = struct {
                     else => {
                         if (cell.char >= 32 and cell.char <= 126) {
                             writer.writeByte(@intCast(cell.char)) catch {};
+                            ascii_cell = true;
                         } else {
                             const len = std.unicode.utf8Encode(@intCast(cell.char), &utf8Buf) catch 1;
                             writer.writeAll(utf8Buf[0..len]) catch {};
                         }
                     },
                 }
+                // Only printable ASCII is certain to advance the cursor by exactly one column.
+                cursor_x = if (ascii_cell) x + 1 else null;
                 runLength += 1;
 
                 // Sync this cell to the current buffer so the next frame's diff

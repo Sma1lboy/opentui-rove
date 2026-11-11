@@ -55,3 +55,6 @@ screenshot-*.png
 host_key
 host_key.pub
 *.host_key
+
+# Rove native packages (scripts/rove-package.ts)
+dist-rove/
